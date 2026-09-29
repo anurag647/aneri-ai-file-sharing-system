@@ -10,6 +10,11 @@ const fs = require("fs");
 const crypto = require("crypto");
 
 const app = express();
+
+// Render runs behind a reverse proxy. Trust the proxy so secure
+// session cookies are correctly recognized on the HTTPS public URL.
+app.set("trust proxy", 1);
+
 const PORT = Number(process.env.PORT || 5000);
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -20,10 +25,12 @@ app.use(session({
   secret: process.env.SESSION_SECRET || "aneri-change-this-secret",
   resave: false,
   saveUninitialized: false,
+  proxy: true,
   cookie: {
     httpOnly: true,
     sameSite: "lax",
     secure: process.env.NODE_ENV === "production",
+    path: "/",
     maxAge: 8 * 60 * 60 * 1000
   }
 }));
@@ -35,9 +42,11 @@ const pool = mysql.createPool({
   user: process.env.DB_USER || "root",
   password: process.env.DB_PASSWORD || "",
   database: process.env.DB_NAME || "aneri_office",
-  // TiDB Cloud Serverless requires an encrypted TLS connection.
+  // TiDB Cloud requires TLS. For local development, certificate
+  // verification can be disabled through DB_SSL_REJECT_UNAUTHORIZED=false.
+  // On Render, leave this variable unset/true so certificate verification stays enabled.
   ssl: {
-    rejectUnauthorized: true
+    rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== "false"
   },
   waitForConnections: true,
   connectionLimit: 10,
@@ -278,10 +287,43 @@ app.post("/api/login", async (req, res) => {
     await pool.query("UPDATE users SET last_login=NOW() WHERE id=?", [user.id]);
     const [freshRows] = await pool.query("SELECT * FROM users WHERE id=? LIMIT 1", [user.id]);
     const freshUser = freshRows[0] || user;
-    req.session.user = publicUser(freshUser, loginRole);
 
-    await logActivity(user.id, "login", `${ROLE_NAMES[loginRole]} login for ${user.employee_id}`);
-    res.json({ success: true, user: req.session.user });
+    // Create a fresh session on every successful login to prevent stale
+    // anonymous sessions from surviving across previous failed attempts.
+    req.session.regenerate(async (regenerateError) => {
+      if (regenerateError) {
+        console.error("Session regenerate error:", regenerateError);
+        return res.status(500).json({ error: "Login session could not be created." });
+      }
+
+      try {
+        req.session.user = publicUser(freshUser, loginRole);
+
+        await logActivity(
+          user.id,
+          "login",
+          `${ROLE_NAMES[loginRole]} login for ${user.employee_id}`
+        );
+
+        // Explicitly persist the session before returning the login response.
+        // This prevents the first protected dashboard request from racing the
+        // session write on Render.
+        req.session.save((saveError) => {
+          if (saveError) {
+            console.error("Session save error:", saveError);
+            return res.status(500).json({ error: "Login session could not be saved." });
+          }
+
+          return res.json({
+            success: true,
+            user: req.session.user
+          });
+        });
+      } catch (sessionError) {
+        console.error("Post-login session error:", sessionError);
+        return res.status(500).json({ error: "Login session could not be completed." });
+      }
+    });
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ error: "Login failed." });
@@ -295,6 +337,14 @@ app.post("/api/logout", auth, async (req, res) => {
 });
 
 app.get("/api/me", auth, (req, res) => res.json({ success: true, user: req.session.user }));
+
+app.get("/api/session-check", (req, res) => {
+  res.json({
+    authenticated: !!req.session.user,
+    session_id_present: !!req.sessionID,
+    secure_cookie: !!req.session.cookie?.secure
+  });
+});
 
 app.get("/api/dashboard", auth, async (req, res) => {
   try {
@@ -638,6 +688,7 @@ initDb()
       console.log("Authentication: ENABLED");
       console.log("Role-based access: ENABLED");
       console.log("Person/Department file sharing: ENABLED");
+      console.log(`Database TLS certificate verification: ${process.env.DB_SSL_REJECT_UNAUTHORIZED === "false" ? "DISABLED (development only)" : "ENABLED"}`);
       console.log("MySQL database: CONNECTED");
       console.log("========================================");
     });
