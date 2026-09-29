@@ -10,11 +10,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 
 const app = express();
-
-// Render runs behind a reverse proxy. Trust the proxy so secure
-// session cookies are correctly recognized on the HTTPS public URL.
 app.set("trust proxy", 1);
-
 const PORT = Number(process.env.PORT || 5000);
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -25,12 +21,10 @@ app.use(session({
   secret: process.env.SESSION_SECRET || "aneri-change-this-secret",
   resave: false,
   saveUninitialized: false,
-  proxy: true,
   cookie: {
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
-    path: "/",
+    secure: "auto",
     maxAge: 8 * 60 * 60 * 1000
   }
 }));
@@ -42,15 +36,16 @@ const pool = mysql.createPool({
   user: process.env.DB_USER || "root",
   password: process.env.DB_PASSWORD || "",
   database: process.env.DB_NAME || "aneri_office",
-  // TiDB Cloud requires TLS. For local development, certificate
-  // verification can be disabled through DB_SSL_REJECT_UNAUTHORIZED=false.
-  // On Render, leave this variable unset/true so certificate verification stays enabled.
-  ssl: {
-    rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== "false"
-  },
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0
+  queueLimit: 0,
+  connectTimeout: Number(process.env.DB_CONNECT_TIMEOUT || 60000),
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 10000,
+  ssl: {
+    rejectUnauthorized:
+      process.env.DB_SSL_REJECT_UNAUTHORIZED !== "false"
+  }
 });
 
 // Department aliases are normalized before comparison so values such as
@@ -73,6 +68,24 @@ function normalizeDepartment(value) {
 function departmentMatches(userDepartment, allowedDepartments) {
   const actual = normalizeDepartment(userDepartment);
   return allowedDepartments.some(item => normalizeDepartment(item) === actual);
+}
+
+function isValidDepartmentTarget(value) {
+  const allowed = new Set([
+    "hr",
+    "human resources",
+    "back office",
+    "backoffice",
+    "telecalling",
+    "tl",
+    "team leader",
+    "team leader (tl)",
+    "fos",
+    "field officer",
+    "field officer sales",
+    "management"
+  ]);
+  return allowed.has(normalizeDepartment(value));
 }
 
 const ROLE_NAMES = {
@@ -288,42 +301,19 @@ app.post("/api/login", async (req, res) => {
     const [freshRows] = await pool.query("SELECT * FROM users WHERE id=? LIMIT 1", [user.id]);
     const freshUser = freshRows[0] || user;
 
-    // Create a fresh session on every successful login to prevent stale
-    // anonymous sessions from surviving across previous failed attempts.
-    req.session.regenerate(async (regenerateError) => {
-      if (regenerateError) {
-        console.error("Session regenerate error:", regenerateError);
-        return res.status(500).json({ error: "Login session could not be created." });
-      }
-
-      try {
-        req.session.user = publicUser(freshUser, loginRole);
-
-        await logActivity(
-          user.id,
-          "login",
-          `${ROLE_NAMES[loginRole]} login for ${user.employee_id}`
-        );
-
-        // Explicitly persist the session before returning the login response.
-        // This prevents the first protected dashboard request from racing the
-        // session write on Render.
-        req.session.save((saveError) => {
-          if (saveError) {
-            console.error("Session save error:", saveError);
-            return res.status(500).json({ error: "Login session could not be saved." });
-          }
-
-          return res.json({
-            success: true,
-            user: req.session.user
-          });
-        });
-      } catch (sessionError) {
-        console.error("Post-login session error:", sessionError);
-        return res.status(500).json({ error: "Login session could not be completed." });
-      }
+    // Regenerate the session after authentication to prevent session fixation.
+    await new Promise((resolve, reject) => {
+      req.session.regenerate(err => err ? reject(err) : resolve());
     });
+
+    req.session.user = publicUser(freshUser, loginRole);
+
+    await new Promise((resolve, reject) => {
+      req.session.save(err => err ? reject(err) : resolve());
+    });
+
+    await logActivity(user.id, "login", `${ROLE_NAMES[loginRole]} login for ${user.employee_id}`);
+    res.json({ success: true, user: req.session.user });
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ error: "Login failed." });
@@ -336,15 +326,25 @@ app.post("/api/logout", auth, async (req, res) => {
   req.session.destroy(() => res.json({ success: true }));
 });
 
-app.get("/api/me", auth, (req, res) => res.json({ success: true, user: req.session.user }));
-
-app.get("/api/session-check", (req, res) => {
-  res.json({
-    authenticated: !!req.session.user,
-    session_id_present: !!req.sessionID,
-    secure_cookie: !!req.session.cookie?.secure
-  });
+app.get("/api/health", async (req, res) => {
+  try {
+    const [[row]] = await pool.query("SELECT 1 AS ok");
+    res.json({
+      success: true,
+      database: row.ok === 1 ? "connected" : "error",
+      session: Boolean(req.session && req.session.user)
+    });
+  } catch (error) {
+    console.error("Health check error:", error);
+    res.status(503).json({
+      success: false,
+      database: "error",
+      session: Boolean(req.session && req.session.user)
+    });
+  }
 });
+
+app.get("/api/me", auth, (req, res) => res.json({ success: true, user: req.session.user }));
 
 app.get("/api/dashboard", auth, async (req, res) => {
   try {
@@ -470,6 +470,16 @@ app.get("/api/monitoring", adminOnly, async (req, res) => {
   }
 });
 
+app.delete("/api/monitoring/activities", adminOnly, async (req, res) => {
+  try {
+    const [result] = await pool.query("DELETE FROM activities");
+    res.json({ success: true, deleted_count: result.affectedRows || 0 });
+  } catch (error) {
+    console.error("Clear activities error:", error);
+    res.status(500).json({ error: "Could not clear recent activity." });
+  }
+});
+
 app.post("/api/profile/photo", auth, async (req, res) => {
   try {
     const { photo } = req.body;
@@ -529,6 +539,11 @@ app.post("/api/files", auth, upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "Please select a valid recipient." });
     }
 
+    if (targetType === "department" && !isValidDepartmentTarget(targetValue)) {
+      fs.unlinkSync(req.file.path);
+      return res.status(400).json({ error: "The selected department is not valid." });
+    }
+
     if (targetType === "person") {
       const [users] = await pool.query("SELECT id,name,department FROM users WHERE employee_id=? AND role='employee' LIMIT 1", [targetValue]);
       if (!users.length) {
@@ -575,6 +590,8 @@ app.get("/api/files/:id/download", auth, async (req, res) => {
 
     await pool.query("UPDATE files SET download_count=download_count+1 WHERE id=?", [file.id]);
     await logActivity(req.session.user.id, "file_download", `Downloaded ${file.original_name}`);
+    const safeDownloadName = String(file.original_name).replace(/["\\r\\n]/g, "_");
+    res.setHeader("Content-Disposition", `attachment; filename="${safeDownloadName}"`);
     res.download(fullPath, file.original_name);
   } catch (error) {
     console.error("Download error:", error);
@@ -688,7 +705,6 @@ initDb()
       console.log("Authentication: ENABLED");
       console.log("Role-based access: ENABLED");
       console.log("Person/Department file sharing: ENABLED");
-      console.log(`Database TLS certificate verification: ${process.env.DB_SSL_REJECT_UNAUTHORIZED === "false" ? "DISABLED (development only)" : "ENABLED"}`);
       console.log("MySQL database: CONNECTED");
       console.log("========================================");
     });
